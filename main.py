@@ -8,18 +8,32 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-import comet_ml
+try:
+    import comet_ml
+
+    use_tensorboard = False
+except ImportError:
+    use_tensorboard = True
+
 import datasets
 import numpy as np
 import torch
 import transformers
 from datasets import concatenate_datasets, load_dataset, load_metric
 from scipy.stats import entropy
-from transformers import (AutoConfig, AutoModelForSequenceClassification,
-                          AutoTokenizer, DataCollatorWithPadding,
-                          EvalPrediction, HfArgumentParser, PretrainedConfig,
-                          Trainer, TrainingArguments, default_data_collator,
-                          set_seed)
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    EvalPrediction,
+    HfArgumentParser,
+    PretrainedConfig,
+    Trainer,
+    TrainingArguments,
+    default_data_collator,
+    set_seed,
+)
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -484,7 +498,7 @@ def _train(raw_datasets, args_dict=None):
     )
     metrics_prefix = f"train_size_{min(max_train_samples, len(train_dataset))}_4e_all"
 
-    if trainer.is_world_process_zero():
+    if trainer.is_world_process_zero() and not use_tensorboard:
         experiment = comet_ml.config.get_global_experiment()
         if experiment is not None:
             experiment.set_name(metrics_prefix)
@@ -553,6 +567,10 @@ def _train(raw_datasets, args_dict=None):
     return evaluation_metrics, test_predictions
 
 
+def run_on_all_train_set(hf_args, raw_datasets):
+    evaluation_metrics, _ = _train(raw_datasets, args_dict=hf_args)
+
+
 def _calculate_entropy(logits):
     probas = torch.nn.Softmax(dim=1)(torch.from_numpy(logits))
     samples_entropy = entropy(probas.transpose(0, 1).cpu())
@@ -566,12 +584,8 @@ def _ask_oracle(unlabled_samples):
     return unlabled_samples
 
 
-def run_on_all_train_set(hf_args, raw_datasets):
-    evaluation_metrics, _ = _train(raw_datasets, args_dict=hf_args)
-
-
 def run_active_learning(
-    hf_args, target_score, raw_datasets, initial_train_dataset_size, query_samples_count
+    hf_args, raw_datasets, target_score, initial_train_dataset_size, query_samples_count
 ):
 
     original_train_dataset = raw_datasets["train"]
@@ -609,10 +623,10 @@ def run_active_learning(
 
         extended_train_dataset = concatenate_datasets(
             [raw_datasets["train"], new_train_samples],
-            info=original_train_split.info,
+            info=original_train_dataset.info,
         )
 
-        unlabeled_dataset = original_train_split.filter(
+        unlabeled_dataset = original_train_dataset.filter(
             lambda s: s["idx"] not in extended_train_dataset["idx"]
         )
 
@@ -623,12 +637,24 @@ def run_active_learning(
 def main(
     task_name,
     do_al,
-    target_score,
     random_seed,
-    initial_train_dataset_size,
-    query_samples_count,
+    target_score=None,
+    initial_train_dataset_size=None,
+    query_samples_count=None,
+    epochs=3,
+    batch_size=32,
 ):
     random.seed(random_seed)
+
+    if use_tensorboard:
+        hf_args.update(
+            {
+                "logging_dir": f"/tmp/{task_name}/tensorboard",
+                "report_to": "tensorboard",
+            }
+        )
+
+    raw_datasets = load_dataset("glue", task_name)
 
     hf_args = {
         "model_name_or_path": "bert-base-cased",
@@ -636,33 +662,31 @@ def main(
         "do_train": True,
         "do_eval": True,
         "max_seq_length": 128,
-        "per_device_train_batch_size": 32,
-        "per_device_eval_batch_size": 32,
-        "learning_rate": 4e-5,
-        "num_train_epochs": 3,
+        "per_device_train_batch_size": batch_size,
+        "per_device_eval_batch_size": batch_size,
+        "learning_rate": 2e-5,
         "overwrite_output_dir": True,
         "output_dir": f"/tmp/{task_name}/",
-        # 'report_to': 'tensorboard',
         "logging_strategy": "steps",
         "logging_steps": 50,
         "evaluation_strategy": "steps",
         "eval_steps": 50,
         "seed": 12,
-        "logging_dir": f"/tmp/{task_name}/tensorboard",
-        "max_steps": 345,
+        "max_steps": int((raw_datasets["train"].num_rows / batch_size) * epochs),
     }
 
-    raw_datasets = load_dataset("glue", task_name)
+    # Using max_steps instead of epochs so that all active learning experiment run
+    # number of iterations
 
     if not do_al:
         run_on_all_train_set(hf_args, raw_datasets)
     else:
         run_active_learning(
-            raw_datasets,
             hf_args,
+            raw_datasets,
+            target_score,
             initial_train_dataset_size,
             query_samples_count,
-            target_score,
         )
 
 
@@ -685,8 +709,8 @@ if __name__ == "__main__":
     main(
         args.task_name,
         args.do_al,
-        args.target_score,
         args.random_seed,
-        args.initial_train_dataset_size,
-        args.query_samples_count,
+        target_score=args.target_score,
+        initial_train_dataset_size=args.initial_train_dataset_size,
+        query_samples_count=args.query_samples_count,
     )
